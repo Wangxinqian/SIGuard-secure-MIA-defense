@@ -36,10 +36,10 @@ make
 Move the following files into your MP-SPDZ project directory:
 
 ```bash
-# MPC protocol file
+# MPC protocol
 cp SiGuard.mpc MP-SPDZ/Programs/Source/
 
-# Training and evaluation logic
+# We add a few changes to the original ml.py files in MP-SPDZ
 cp defender_model.py ml.py MP-SPDZ/Compiler/
 ```
 
