@@ -1,0 +1,250 @@
+from Compiler import ml
+from Compiler import util
+from Compiler import mpc_math
+from Compiler import instructions
+from Compiler import defender_model
+from Compiler import library
+import numpy as np
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+#player 0 is the defender, player 1 is the cloud user
+
+# Set truncation and precision
+program.use_trunc_pr = True
+program.use_split(3)
+sfix.set_precision(16, 31)
+
+num_features = 8
+max_iter = 49
+defend_attacker = defender_model.Mem_attacker(input_dim = num_features)
+defend_attacker.load_state_dict(torch.load('my_data/defender_ch_minist_AS19.pth'))
+W_List,b_List = ml.decompose_defender(dense_index=[0,2,4], model=defend_attacker)
+
+# input data: confidence vector with the shape of [[data, membership label], [data, membership label], ...]
+# data with the shape of (1,num_features), membership label with the shape of (1)
+_, In_mem_data, _, _, _ = torch.load('./my_data/in_' + 'ch_minist_AS19' + '.pt')
+_, Out_mem_data, _, _, _ = torch.load('./my_data/out_' + 'ch_minist_AS19' + '.pt')
+#add from 21/Aug only for high dimension data
+#In_mem_data = In_mem_data
+#Out_mem_data = Out_mem_data
+In_mem_data = In_mem_data.numpy().astype(np.float64)
+Out_mem_data = Out_mem_data.numpy().astype(np.float64)
+
+#positive
+print_ln('positive, number of feature is: %s, the total length of data record is %s',num_features, len(In_mem_data))
+#negative
+print_ln('negative, number of feature is: %s, the total length of data record is %s',num_features, len(Out_mem_data))
+
+#input into the player
+print_ln('In member')
+In_len = len(In_mem_data)
+In_mem_data = sfix.input_tensor_via(1, In_mem_data.tolist())
+
+@for_range_opt(In_len)
+def _(pointer1):
+    logits = In_mem_data[pointer1] #<class 'Compiler.types.Array'>
+    e_p = sfix.Array(num_features).assign_all(0) #<class 'Compiler.types.Array'>
+    p = Array.create_from(ml.pi_softmax(logits)) #<class 'Compiler.types.sfix'>
+
+    #l = argmax(p)
+    max = sfix(p[0])
+    max_index = ml.one_hot_generate(num_features, 0)
+    for i in range(1,num_features):
+        pointer1_bit = max > p[i]
+        max = pointer1_bit.if_else(max, p[i]) #max if pointer1_bit is 1, p[i] if self is 0
+        max_index = pointer1_bit.if_else(max_index, ml.one_hot_generate(num_features, i))
+
+    #\tilda{h}'s forward function
+    alogits_p = ml.defender_forward(p,W_List,b_List)[0]
+    c1,c2,c3,lr = sfix(1.),sfix(10.),sfix(0.1),sfix(0.2)
+
+    @for_range_opt(6)
+    def _(pointer2):
+        e = sfix.Array(num_features).assign_all(0)
+        @for_range_opt(max_iter)
+        def _(pointer3):
+            p_star = Array.create_from(ml.pi_softmax(e[:]+logits[:]))
+            #\tilda{h}(p_star) forward function
+            alogits_p_star,drelu_List = ml.defender_forward(p_star,W_List,b_List)
+
+            #\pi_{DL1}
+            pi_abs = (alogits_p_star[0]>0).if_else(sfix(1), sfix(-1))
+            # the 4th dense layer
+            W_last = sfix.Matrix(1,64)
+            W_last.assign(W_List[2])
+            W_last[:] = pi_abs*W_last[:]
+            # the 3th relu layer
+            W_last[:] *= drelu_List[1][:]
+            # the 2th dense layer
+            W_last = W_last.dot(W_List[1])
+            # the 1th relu layer
+            W_last[:] *= drelu_List[0][:]
+            # the 0th dense layer
+            W_last = W_last.dot(W_List[0])
+            #\pi_{softmax}
+            g_L1 = sfix.Array(num_features)
+            for i in range(num_features):
+                s = sfix(0)
+                for j in range(num_features):
+                    if i==j:
+                        dirichlet = sfix(1)
+                    else:
+                        dirichlet = sfix(0)
+                    s += W_last[0][j]*p_star[i]*(dirichlet-p_star[j])
+                g_L1.assign(s,i)
+
+            #\pi_{DL2}
+            g_L2 = sfix.Array(num_features)
+            max_star = sfix(p_star[0])
+            max_star_index = ml.one_hot_generate(num_features, 0)
+            for i in range(1,num_features):
+                pointer3_bit = max_star > p_star[i]
+                max_star = pointer3_bit.if_else(max_star, p_star[i])
+                max_star_index = pointer3_bit.if_else(max_star_index, ml.one_hot_generate(num_features, i))
+            g_L2.assign(max_star_index-max_index)
+
+            #\pi_{DL3}
+            g_abs_L3 = sfix.Array(num_features)
+            g_abs_L3[:] = p_star[:]-p[:]
+            g_abs_L3[:] = (g_abs_L3[:]>=0).if_else(sfix(1), sfix(-1))
+
+            #\pi_softmax
+            g_L3 = sfix.Array(num_features)
+            for i in range(num_features):
+                s = sfix(0)
+                for j in range(num_features):
+                    if i==j:
+                        dirichlet = sfix(1)
+                    else:
+                        dirichlet = sfix(0)
+                    s += sfix(g_abs_L3[j])*p_star[i]*(dirichlet-p_star[j])
+                g_L3.assign(s,i)
+
+            #Return
+            g_L = sfix.Array(num_features)
+            g_L.assign(c1*g_L1 +c2*g_L2 +c3*g_L3)
+            g_L_norm = ml.l2_norm(g_L1)
+            g_L1[:] = g_L1[:]/g_L_norm
+            e[:] -= lr*g_L1[:]
+
+        #\pi_{noise validator}
+        b1 = (ml.argmax(logits) == ml.argmax(e+logits))
+        p_star = Array.create_from(ml.pi_softmax(e[:]+logits[:]))
+        alogits_p_star,_ = ml.defender_forward(p_star,W_List,b_List)
+        b2 = (alogits_p * alogits_p_star) <= 0
+        and_bit = b1.bit_and(b2)
+        e_p[:] = and_bit.if_else(e ,e_p)[:]
+        #c3.update
+        c3.update(and_bit.if_else(10*c3,c3))
+        #lr.update
+        lr.update(and_bit.if_else(lr,1.1*lr))
+
+    print_ln('%s %s', pointer1.reveal(),(e_p).reveal())
+
+#input into the player
+print_ln('Out member')
+out_len = len(Out_mem_data)
+Out_mem_data = sfix.input_tensor_via(1, Out_mem_data.tolist())
+
+@for_range_opt(out_len)
+def _(pointer1):
+    logits = Out_mem_data[pointer1] #<class 'Compiler.types.Array'>
+    e_p = sfix.Array(num_features).assign_all(0) #<class 'Compiler.types.Array'>
+    p = Array.create_from(ml.pi_softmax(logits)) #<class 'Compiler.types.sfix'>
+
+    #l = argmax(p)
+    max = sfix(p[0])
+    max_index = ml.one_hot_generate(num_features, 0)
+    for i in range(1,num_features):
+        pointer1_bit = max > p[i]
+        max = pointer1_bit.if_else(max, p[i]) #max if pointer1_bit is 1, p[i] if self is 0
+        max_index = pointer1_bit.if_else(max_index, ml.one_hot_generate(num_features, i))
+
+    #\tilda{h}'s forward function
+    alogits_p = ml.defender_forward(p,W_List,b_List)[0]
+    c1,c2,c3,lr = sfix(1.),sfix(10.),sfix(0.1),sfix(0.2)
+
+    @for_range_opt(6)
+    def _(pointer2):
+        e = sfix.Array(num_features).assign_all(0)
+        @for_range_opt(max_iter)
+        def _(pointer3):
+            p_star = Array.create_from(ml.pi_softmax(e[:]+logits[:]))
+            #\tilda{h}(p_star) forward function
+            alogits_p_star,drelu_List = ml.defender_forward(p_star,W_List,b_List)
+
+            #\pi_{DL1}
+            pi_abs = (alogits_p_star[0]>0).if_else(sfix(1), sfix(-1))
+            # the 4th dense layer
+            W_last = sfix.Matrix(1,64)
+            W_last.assign(W_List[2])
+            W_last[:] = pi_abs*W_last[:]
+            # the 3th relu layer
+            W_last[:] *= drelu_List[1][:]
+            # the 2th dense layer
+            W_last = W_last.dot(W_List[1])
+            # the 1th relu layer
+            W_last[:] *= drelu_List[0][:]
+            # the 0th dense layer
+            W_last = W_last.dot(W_List[0])
+            #\pi_{softmax}
+            g_L1 = sfix.Array(num_features)
+            for i in range(num_features):
+                s = sfix(0)
+                for j in range(num_features):
+                    if i==j:
+                        dirichlet = sfix(1)
+                    else:
+                        dirichlet = sfix(0)
+                    s += W_last[0][j]*p_star[i]*(dirichlet-p_star[j])
+                g_L1.assign(s,i)
+
+            #\pi_{DL2}
+            g_L2 = sfix.Array(num_features)
+            max_star = sfix(p_star[0])
+            max_star_index = ml.one_hot_generate(num_features, 0)
+            for i in range(1,num_features):
+                pointer3_bit = max_star > p_star[i]
+                max_star = pointer3_bit.if_else(max_star, p_star[i])
+                max_star_index = pointer3_bit.if_else(max_star_index, ml.one_hot_generate(num_features, i))
+            g_L2.assign(max_star_index-max_index)
+
+            #\pi_{DL3}
+            g_abs_L3 = sfix.Array(num_features)
+            g_abs_L3[:] = p_star[:]-p[:]
+            g_abs_L3[:] = (g_abs_L3[:]>=0).if_else(sfix(1), sfix(-1))
+
+            #\pi_softmax
+            g_L3 = sfix.Array(num_features)
+            for i in range(num_features):
+                s = sfix(0)
+                for j in range(num_features):
+                    if i==j:
+                        dirichlet = sfix(1)
+                    else:
+                        dirichlet = sfix(0)
+                    s += sfix(g_abs_L3[j])*p_star[i]*(dirichlet-p_star[j])
+                g_L3.assign(s,i)
+
+            #Return
+            g_L = sfix.Array(num_features)
+            g_L.assign(c1*g_L1 +c2*g_L2 +c3*g_L3)
+            g_L_norm = ml.l2_norm(g_L1)
+            g_L1[:] = g_L1[:]/g_L_norm
+            e[:] -= lr*g_L1[:]
+
+        #\pi_{noise validator}
+        b1 = (ml.argmax(logits) == ml.argmax(e+logits))
+        p_star = Array.create_from(ml.pi_softmax(e[:]+logits[:]))
+        alogits_p_star,_ = ml.defender_forward(p_star,W_List,b_List)
+        b2 = (alogits_p * alogits_p_star) <= 0
+        and_bit = b1.bit_and(b2)
+        e_p[:] = and_bit.if_else(e ,e_p)[:]
+        #c3.update
+        c3.update(and_bit.if_else(10*c3,c3))
+        #lr.update
+        lr.update(and_bit.if_else(lr,1.1*lr))
+    print_ln('%s %s', pointer1.reveal(),(e_p).reveal())
