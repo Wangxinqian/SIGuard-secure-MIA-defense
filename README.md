@@ -54,3 +54,15 @@ make -j 8 replicated-ring-party.x
 ./compile.py -M -R 64 SiGuard
 Scripts/ring.sh SiGuard
 ```
+
+## 📜 Citation
+
+If you use this codebase in your research, please cite:
+
+```bibtex
+@inproceedings{wang2025siguard,
+  author={Xinqian Wang and Xiaoning Liu and Shangqi Lai and Xun Yi and Xingliang Yuan},
+  title={SIGuard: Guarding Secure Inference with Post Data Privacy},
+  booktitle={NDSS},
+  year={2025}
+}
